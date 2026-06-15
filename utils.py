@@ -66,10 +66,12 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
 
     先尝试整体解析；若失败则定位首尾花括号后截取解析。
     返回 dict 或 None。
+    会兼容模型常见的中文弯引号输出。
     """
     raw = str(text or "").strip()
     if not raw:
         return None
+    raw = raw.replace("“", '"').replace("”", '"')
 
     # 尝试整体解析
     try:
@@ -95,7 +97,7 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
 def normalize_risk(risk: str, reason: str) -> str:
     """将风险标签和原因归一化为标准风险类型。
 
-    优先从 reason 文本中识别具体类型（性骚扰、辱骂、性邀请），
+    优先从 reason 文本中识别具体类型（性骚扰、辱骂、性邀请、地狱笑话），
     否则保留原始 risk 值，无法识别则返回 "none"。
     """
     raw = str(risk or "none").strip().lower() or "none"
@@ -108,10 +110,16 @@ def normalize_risk(risk: str, reason: str) -> str:
         return "insult"
     if any(kw in text for kw in ("性邀请", "亲密邀请", "做爱", "上床", "开房", "sex", "sexual_invitation")):
         return "sexual_invitation"
+    if any(kw in text for kw in (
+        "地狱笑话", "地狱梗", "dark_humor", "灾难玩笑",
+        "死亡玩笑", "疾病玩笑", "歧视性", "冒犯性幽默",
+    )):
+        return "dark_humor"
 
     # 合法的标准值
     valid = {"none", "spam", "insult", "sexual_harassment",
-             "sexual_invitation", "prompt_injection", "unsafe_request"}
+             "sexual_invitation", "prompt_injection", "unsafe_request",
+             "dark_humor"}
     return raw if raw in valid else "none"
 
 
