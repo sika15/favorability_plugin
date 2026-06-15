@@ -209,18 +209,21 @@ class EvaluationHandler:
             return
 
         # 委托 store 写入（包含倍率/缓冲/晋级校验等完整逻辑）
-        updated_user, actual_delta = self._plugin._store.apply_delta(
+        # apply_delta 返回 (user, actual_delta, raw_delta)
+        # - actual_delta: 缓冲/减速后的实际变化值
+        # - raw_delta: 缓冲前的原始变化值，用于反馈通知判断
+        updated_user, actual_delta, raw_delta = self._plugin._store.apply_delta(
             user_id, delta, confidence, reason, risk, session_id, cfg
         )
 
         self._plugin._debug_log(
-            "好感度已写入：user=%s actual_delta=%s new_score=%s level=%s",
-            user_id, actual_delta, updated_user.get("score"),
+            "好感度已写入：user=%s actual_delta=%s raw_delta=%s new_score=%s level=%s",
+            user_id, actual_delta, raw_delta, updated_user.get("score"),
             level_for_score(int(updated_user.get("score", cfg.score.default_score) or 0)),
         )
 
-        # 发送变化反馈
-        await self._send_delta_feedback(session_id, actual_delta)
+        # 发送变化反馈（基于 raw_delta 判断，actual_delta 展示实际变化）
+        await self._send_delta_feedback(session_id, actual_delta, raw_delta)
 
     # ── Prompt 构建（重构版） ────────────────────────────────────
 
@@ -278,19 +281,47 @@ class EvaluationHandler:
 
     # ── 反馈发送 ─────────────────────────────────────────────────
 
-    async def _send_delta_feedback(self, session_id: str, delta: int) -> None:
-        """发送好感度变化反馈提示"""
+    async def _send_delta_feedback(self, session_id: str, actual_delta: int, raw_delta: int) -> None:
+        """发送好感度变化反馈提示。
+
+        参数说明：
+        - actual_delta: 实际写入的分值变化（可能被缓冲/减速削弱）
+        - raw_delta: 缓冲前的原始变化值，用于判断是否值得通知
+
+        重构改进：
+        - 基于 raw_delta 判断是否发送通知（解决缓冲导致通知消失的问题）
+        - 通知内容展示 actual_delta（实际变化值）
+        - 缓冲生效时附加"关系动摇"提示
+        """
         cfg = self._plugin.config
-        if not cfg.feedback.enabled or abs(delta) < int(cfg.feedback.min_abs_delta_to_notify):
+        # 使用 raw_delta 判断是否达到通知门槛（避免缓冲导致通知消失）
+        if not cfg.feedback.enabled or abs(raw_delta) < int(cfg.feedback.min_abs_delta_to_notify):
             return
 
-        delta_text = f"（{delta:+d}）" if cfg.feedback.show_delta_value else ""
-        template = cfg.feedback.positive_template if delta > 0 else cfg.feedback.negative_template
+        # 如果实际变化为 0（被缓冲完全吸收），发送特殊的"动摇"提示
+        if actual_delta == 0 and raw_delta < 0:
+            try:
+                await self._plugin.ctx.send.text(
+                    f"{self._plugin._bot_name()}感觉到你们的关系有些动摇……",
+                    session_id,
+                )
+            except Exception:
+                pass
+            return
+
+        # 正常反馈
+        delta_text = f"（{actual_delta:+d}）" if cfg.feedback.show_delta_value else ""
+        template = cfg.feedback.positive_template if actual_delta > 0 else cfg.feedback.negative_template
         text = template.format(
             bot_name=self._plugin._bot_name(),
-            delta=delta, delta_text=delta_text,
+            delta=actual_delta, delta_text=delta_text,
         )
+
+        # 缓冲生效时追加"动摇"提示
+        if raw_delta != actual_delta and actual_delta < 0 and cfg.injection.show_buffer_hint:
+            text += "（关系似乎没有立刻恶化……）"
+
         try:
             await self._plugin.ctx.send.text(text, session_id)
         except Exception:
-            self._plugin._debug_log("发送变化提示失败：session=%s delta=%s", session_id, delta, exc_info=True)
+            self._plugin._debug_log("发送变化提示失败：session=%s delta=%s", session_id, actual_delta, exc_info=True)
