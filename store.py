@@ -1,25 +1,20 @@
 """
 好感度插件 - SQLite 数据存储
 
-管理用户好感度数据的持久化，包括：
-- 建表与 JSON 遗留数据迁移
-- 用户数据的 CRUD 操作
-- 好感度变化（delta）的写入与晋级校验
-- 久未互动衰减的计算与应用
+管理用户好感度数据的持久化：CRUD、delta写入与晋级校验、久未互动衰减。
 
 重构改进：
-1. apply_delta 倍率计算改为"先乘后钳"（不再二次钳制使倍率失效）
-2. 新增降级缓冲机制（高级档扣分先消耗缓冲再掉级）
-3. 新增恋人档渐进减速（使用 lover_growth_rate 替代粗暴 cap=2）
-4. 新增首因效应（新用户前 N 条评价有保护倍率）
-5. 晋级门槛统一由 levels 模块查询，不再硬编码
+1. apply_delta 倍率"先乘后钳"（不再二次钳制使倍率失效）
+2. 降级缓冲（高级档扣分先消耗缓冲再掉级）
+3. 恋人档渐进减速（lover_growth_rate 替代粗暴 cap=2）
+4. 首因效应（新用户前 N 条评价有保护倍率）
+5. 晋级门槛统一由 levels 模块查询
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-import time
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -31,6 +26,22 @@ from .levels import (
     lover_growth_rate, score_threshold_for_level,
 )
 from .utils import clamp, clean_text, now, normalize_risk
+
+# ── SQL 模板 ────────────────────────────────────────────────────
+
+_UPSERT_SQL = """
+INSERT INTO users (
+    user_id, score, message_count, positive_eval_count, negative_eval_count,
+    last_eval_at, last_interaction_at, updated_at, recent_reasons
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(user_id) DO UPDATE SET
+    score = excluded.score, message_count = excluded.message_count,
+    positive_eval_count = excluded.positive_eval_count,
+    negative_eval_count = excluded.negative_eval_count,
+    last_eval_at = excluded.last_eval_at,
+    last_interaction_at = excluded.last_interaction_at,
+    updated_at = excluded.updated_at, recent_reasons = excluded.recent_reasons
+"""
 
 
 class FavorabilityStore:
@@ -45,8 +56,6 @@ class FavorabilityStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self.load()
 
-    # ── 初始化与迁移 ─────────────────────────────────────────────
-
     def load(self) -> None:
         """初始化数据库 schema 并尝试从旧版 JSON 迁移数据"""
         with closing(self._connect()) as conn:
@@ -60,26 +69,18 @@ class FavorabilityStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path)
         conn.row_factory = sqlite3.Row
-        return conn
-
-    @staticmethod
+        return conn    @staticmethod
     def _init_schema(conn: sqlite3.Connection) -> None:
         """创建 users 表（如不存在）"""
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id TEXT PRIMARY KEY,
-                score INTEGER NOT NULL,
-                message_count INTEGER NOT NULL,
-                positive_eval_count INTEGER NOT NULL,
-                negative_eval_count INTEGER NOT NULL,
-                last_eval_at REAL NOT NULL,
-                last_interaction_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
+                user_id TEXT PRIMARY KEY, score INTEGER NOT NULL,
+                message_count INTEGER NOT NULL, positive_eval_count INTEGER NOT NULL,
+                negative_eval_count INTEGER NOT NULL, last_eval_at REAL NOT NULL,
+                last_interaction_at REAL NOT NULL, updated_at REAL NOT NULL,
                 recent_reasons TEXT NOT NULL
             )
-            """
-        )
+        """)
         conn.commit()
 
     def _migrate_legacy_json(self, conn: sqlite3.Connection) -> None:
@@ -95,11 +96,9 @@ class FavorabilityStore:
         users = raw.get("users") if isinstance(raw, dict) else None
         if not isinstance(users, dict):
             return
-        for user_id, user in users.items():
-            if not isinstance(user, dict):
-                continue
-            default = int(user.get("score", 0) or 0)
-            self._upsert_user(conn, str(user_id), self._normalize_user(user, default))
+        for uid, u in users.items():
+            if isinstance(u, dict):
+                self._upsert_user(conn, str(uid), self._normalize_user(u, int(u.get("score", 0) or 0)))
         conn.commit()
 
     # ── 用户数据格式化 ───────────────────────────────────────────
@@ -145,14 +144,12 @@ class FavorabilityStore:
         if not isinstance(reasons, list):
             reasons = []
         return {
-            "score": int(row["score"]),
-            "message_count": int(row["message_count"]),
+            "score": int(row["score"]), "message_count": int(row["message_count"]),
             "positive_eval_count": int(row["positive_eval_count"]),
             "negative_eval_count": int(row["negative_eval_count"]),
             "last_eval_at": float(row["last_eval_at"]),
             "last_interaction_at": float(row["last_interaction_at"]),
-            "updated_at": float(row["updated_at"]),
-            "recent_reasons": reasons,
+            "updated_at": float(row["updated_at"]), "recent_reasons": reasons,
         }
 
     # ── 写入操作 ─────────────────────────────────────────────────
@@ -160,44 +157,32 @@ class FavorabilityStore:
     @staticmethod
     def _upsert_user(conn: sqlite3.Connection, user_id: str, user: dict[str, Any]) -> None:
         """插入或更新用户记录（ON CONFLICT DO UPDATE）"""
-        conn.execute(
-            """
-            INSERT INTO users (
-                user_id, score, message_count, positive_eval_count, negative_eval_count,
-                last_eval_at, last_interaction_at, updated_at, recent_reasons
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                score = excluded.score,
-                message_count = excluded.message_count,
-                positive_eval_count = excluded.positive_eval_count,
-                negative_eval_count = excluded.negative_eval_count,
-                last_eval_at = excluded.last_eval_at,
-                last_interaction_at = excluded.last_interaction_at,
-                updated_at = excluded.updated_at,
-                recent_reasons = excluded.recent_reasons
-            """,
-            (
-                user_id,
-                int(user.get("score", 0) or 0),
-                int(user.get("message_count", 0) or 0),
-                int(user.get("positive_eval_count", 0) or 0),
-                int(user.get("negative_eval_count", 0) or 0),
-                float(user.get("last_eval_at", 0.0) or 0.0),
-                float(user.get("last_interaction_at", now()) or now()),
-                float(user.get("updated_at", now()) or now()),
-                json.dumps(
-                    user.get("recent_reasons") if isinstance(user.get("recent_reasons"), list) else [],
-                    ensure_ascii=False,
-                ),
-            ),
-        )
+        reasons_data = user.get("recent_reasons")
+        conn.execute(_UPSERT_SQL, (
+            user_id,
+            int(user.get("score", 0) or 0), int(user.get("message_count", 0) or 0),
+            int(user.get("positive_eval_count", 0) or 0), int(user.get("negative_eval_count", 0) or 0),
+            float(user.get("last_eval_at", 0.0) or 0.0),
+            float(user.get("last_interaction_at", now()) or now()),
+            float(user.get("updated_at", now()) or now()),
+            json.dumps(reasons_data if isinstance(reasons_data, list) else [], ensure_ascii=False),
+        ))
 
     def save_user(self, user_id: str, user: dict[str, Any]) -> None:
         """保存（更新）单个用户数据"""
         with closing(self._connect()) as conn:
-            default = int(user.get("score", 0) or 0)
-            self._upsert_user(conn, user_id, self._normalize_user(user, default))
+            self._upsert_user(conn, user_id, self._normalize_user(user, int(user.get("score", 0) or 0)))
             conn.commit()
+
+    def _append_reason(self, user: dict[str, Any], record: dict[str, Any], max_records: int) -> None:
+        """向用户记录追加一条评分原因，并裁剪到 max_records"""
+        records = user.setdefault("recent_reasons", [])
+        if not isinstance(records, list):
+            records = []
+            user["recent_reasons"] = records
+        records.append(record)
+        if len(records) > max_records:
+            del records[:-max_records]
 
     # ── 读取操作 ─────────────────────────────────────────────────
 
@@ -230,104 +215,58 @@ class FavorabilityStore:
         return self.get_user(user_id, cfg.score.default_score)
 
     def apply_delta(
-        self,
-        user_id: str,
-        delta: int,
-        confidence: float,
-        reason: str,
-        risk: str,
-        session_id: str,
-        cfg: FavorabilityConfig,
-    ) -> tuple[dict[str, Any], int]:
+        self, user_id: str, delta: int, confidence: float, reason: str,
+        risk: str, session_id: str, cfg: FavorabilityConfig,
+    ) -> tuple[dict[str, Any], int, int]:
         """应用好感度变化值（重构版）。
 
+        返回 (user, actual_delta, raw_delta)：
+        - actual_delta: 实际写入的变化值（经过缓冲/减速等修正后）
+        - raw_delta: 缓冲前的原始变化值（用于反馈通知判断）
+
         处理链路：
-        1. 钳制原始 delta → 乘以倍率 → 再次钳制（修复：倍率后用 max_delta*multiplier 上限）
-        2. 首因效应保护（新用户前几次评价有缩放）
+        1. 钳制原始 delta → 乘以倍率 → 用扩大上限钳制（修复倍率失效）
+        2. 首因效应保护（新用户前几次评价缩小负向 delta）
         3. 高好感辱骂豁免
-        4. 恋人档渐进减速（使用 lover_growth_rate 平滑衰减）
-        5. 降级缓冲（高级档扣分先消耗缓冲再真正掉级）
+        4. 恋人档渐进减速（lover_growth_rate 平滑衰减）
+        5. 降级缓冲（高级档扣分先消耗缓冲再掉级）
         6. 晋级门槛校验（从 levels 模块统一查询）
         7. 写入变更 + 记录原因
-
-        Returns:
-            (更新后的用户字典, 实际变化值)
         """
         user = self.get_user(user_id, cfg.score.default_score)
         risk = normalize_risk(risk, reason)
         old_score = int(user.get("score", cfg.score.default_score) or 0)
 
-        # ── 步骤 1：倍率计算（修复版） ──
-        # 旧逻辑：先钳制到 [-8,8]，乘倍率，再钳制到 [-8,8] → 倍率几乎无效
-        # 新逻辑：先钳制原始 delta，乘倍率，再用扩大后的上限钳制
-        max_raw_delta = max(1, int(cfg.score.max_delta_per_eval))
-        raw_delta = clamp(int(delta), -max_raw_delta, max_raw_delta)
+        # 步骤 1：倍率计算（修复版）
+        adj_delta = self._apply_multiplier(delta, cfg)
 
-        if raw_delta > 0:
-            pos_mult = float(cfg.score.positive_delta_multiplier)
-            adj_delta = max(1, round(raw_delta * pos_mult))
-            # 扩大上限：原始上限 × 倍率，确保倍率真正生效
-            adj_max = max(max_raw_delta, round(max_raw_delta * pos_mult))
-            adj_delta = clamp(adj_delta, 1, adj_max)
-        elif raw_delta < 0:
-            neg_mult = float(cfg.score.negative_delta_multiplier)
-            adj_delta = min(-1, round(raw_delta * neg_mult))
-            adj_max = max(max_raw_delta, round(max_raw_delta * neg_mult))
-            adj_delta = clamp(adj_delta, -adj_max, -1)
-        else:
-            adj_delta = 0
-
-        # ── 步骤 2：首因效应保护 ──
-        # 新用户（正向评价 < 5 次）的负向 delta 缩小，避免初始印象被单条消息毁掉
-        eval_count = int(user.get("positive_eval_count", 0) or 0) + int(user.get("negative_eval_count", 0) or 0)
+        # 步骤 2：首因效应保护
+        eval_count = (int(user.get("positive_eval_count", 0) or 0)
+                      + int(user.get("negative_eval_count", 0) or 0))
         if adj_delta < 0 and eval_count < 5:
             adj_delta = max(-2, round(adj_delta * 0.5))
 
-        # ── 步骤 3：高好感辱骂豁免 ──
+        # 步骤 3：高好感辱骂豁免
         if old_score >= int(cfg.score.ignore_abuse_negative_min_score) and adj_delta < 0:
             if risk in {"insult", "sexual_harassment"}:
                 adj_delta = 0
 
-        # ── 步骤 4：恋人档渐进减速 ──
+        # 步骤 4：恋人档渐进减速
         if adj_delta > 0 and old_score >= 91 and cfg.progression.lover_growth_slowdown:
-            rate = lover_growth_rate(old_score)
-            adj_delta = max(1, round(adj_delta * rate))
+            adj_delta = max(1, round(adj_delta * lover_growth_rate(old_score)))
 
-        # ── 步骤 5：降级缓冲 ──
-        # 高级档扣分时先消耗缓冲区，缓冲区内只降到门槛线，不掉级
-        if adj_delta < 0:
-            buffer = demotion_buffer_for_score(old_score)
-            if buffer > 0:
-                threshold = score_threshold_for_level(level_for_score(old_score))
-                if threshold is not None:
-                    # 最低只降到当前等级的门槛分数，不超过缓冲值
-                    floor = max(threshold, old_score - buffer)
-                    candidate = old_score + adj_delta
-                    if candidate < floor:
-                        # 缓冲吸收了部分扣分
-                        adj_delta = floor - old_score
+        # 保存缓冲前原始变化值（用于反馈通知）
+        raw_delta = adj_delta
 
-        # ── 步骤 6：晋级门槛校验 ──
+        # 步骤 5：降级缓冲（可配置开关）
+        if cfg.progression.demotion_buffer_enabled:
+            adj_delta = self._apply_demotion_buffer(old_score, adj_delta)
+
+        # 步骤 6：晋级门槛校验
         candidate = clamp(old_score + adj_delta, cfg.score.min_score, cfg.score.max_score)
-        new_level = level_for_score(candidate)
-        old_level = level_for_score(old_score)
+        candidate = self._check_promotion_gates(old_score, candidate, confidence, user, cfg)
 
-        if new_level != old_level and new_level in GATE_LEVELS:
-            # 升入"喜欢的人"：需要最低置信度
-            if new_level == "喜欢的人" and confidence < cfg.progression.liked_unlock_min_confidence:
-                threshold = score_threshold_for_level("喜欢的人")
-                if threshold is not None:
-                    candidate = min(candidate, threshold - 1)
-            # 升入"恋人"：需要置信度 + 正向评价次数
-            if new_level == "恋人":
-                enough_conf = confidence >= cfg.progression.lover_unlock_min_confidence
-                enough_hist = int(user.get("positive_eval_count", 0) or 0) >= cfg.progression.lover_min_positive_eval_count
-                if not (enough_conf and enough_hist):
-                    threshold = score_threshold_for_level("恋人")
-                    if threshold is not None:
-                        candidate = min(candidate, threshold - 1)
-
-        # ── 步骤 7：写入变更 ──
+        # 步骤 7：写入变更 + 记录
         actual_delta = candidate - old_score
         user["score"] = candidate
         user["updated_at"] = now()
@@ -336,45 +275,91 @@ class FavorabilityStore:
             user["positive_eval_count"] = int(user.get("positive_eval_count", 0) or 0) + 1
         elif actual_delta < 0:
             user["negative_eval_count"] = int(user.get("negative_eval_count", 0) or 0) + 1
+        elif raw_delta != 0 and actual_delta == 0:
+            # 缓冲完全吸收了扣分，仍记一次负面评价
+            user["negative_eval_count"] = int(user.get("negative_eval_count", 0) or 0) + 1
 
-        # 记录评分原因
+        # 记录评分原因，缓冲生效时额外标记
         if cfg.privacy.store_reasons and cfg.privacy.max_reason_records > 0:
-            records = user.setdefault("recent_reasons", [])
-            if not isinstance(records, list):
-                records = []
-                user["recent_reasons"] = records
-            records.append({
-                "delta": actual_delta,
-                "reason": clean_text(reason, 160),
-                "confidence": round(float(confidence), 3),
-                "risk": risk,
-                "timestamp": now(),
-                "session_id": session_id,
-            })
-            max_records = int(cfg.privacy.max_reason_records)
-            if len(records) > max_records:
-                del records[:-max_records]
+            record: dict[str, Any] = {
+                "delta": actual_delta, "reason": clean_text(reason, 160),
+                "confidence": round(float(confidence), 3), "risk": risk,
+                "timestamp": now(), "session_id": session_id,
+            }
+            if raw_delta != actual_delta:
+                record["raw_delta"] = raw_delta
+                record["buffered"] = True
+            self._append_reason(user, record, int(cfg.privacy.max_reason_records))
 
         self.save_user(user_id, user)
-        return user, actual_delta
+        return user, actual_delta, raw_delta
+
+    @staticmethod
+    def _apply_multiplier(delta: int, cfg: FavorabilityConfig) -> int:
+        """步骤 1：钳制原始 delta，乘倍率，用扩大上限再钳制"""
+        max_raw = max(1, int(cfg.score.max_delta_per_eval))
+        raw = clamp(int(delta), -max_raw, max_raw)
+        if raw > 0:
+            mult = float(cfg.score.positive_delta_multiplier)
+            adj = max(1, round(raw * mult))
+            return clamp(adj, 1, max(max_raw, round(max_raw * mult)))
+        if raw < 0:
+            mult = float(cfg.score.negative_delta_multiplier)
+            adj = min(-1, round(raw * mult))
+            return clamp(adj, -max(max_raw, round(max_raw * mult)), -1)
+        return 0
+
+    @staticmethod
+    def _apply_demotion_buffer(old_score: int, adj_delta: int) -> int:
+        """步骤 5：降级缓冲 — 高级档扣分先消耗缓冲再掉级"""
+        if adj_delta >= 0:
+            return adj_delta
+        buffer = demotion_buffer_for_score(old_score)
+        if buffer <= 0:
+            return adj_delta
+        threshold = score_threshold_for_level(level_for_score(old_score))
+        if threshold is None:
+            return adj_delta
+        floor = max(threshold, old_score - buffer)
+        candidate = old_score + adj_delta
+        if candidate < floor:
+            return floor - old_score
+        return adj_delta
+
+    @staticmethod
+    def _check_promotion_gates(
+        old_score: int, candidate: int, confidence: float,
+        user: dict[str, Any], cfg: FavorabilityConfig,
+    ) -> int:
+        """步骤 6：晋级门槛校验"""
+        new_level = level_for_score(candidate)
+        old_level = level_for_score(old_score)
+        if new_level == old_level or new_level not in GATE_LEVELS:
+            return candidate
+        if new_level == "喜欢的人" and confidence < cfg.progression.liked_unlock_min_confidence:
+            threshold = score_threshold_for_level("喜欢的人")
+            if threshold is not None:
+                candidate = min(candidate, threshold - 1)
+        if new_level == "恋人":
+            enough_conf = confidence >= cfg.progression.lover_unlock_min_confidence
+            enough_hist = int(user.get("positive_eval_count", 0) or 0) >= cfg.progression.lover_min_positive_eval_count
+            if not (enough_conf and enough_hist):
+                threshold = score_threshold_for_level("恋人")
+                if threshold is not None:
+                    candidate = min(candidate, threshold - 1)
+        return candidate
 
     # ── 久未互动衰减 ─────────────────────────────────────────────
 
     def _calculate_inactivity_decay(
         self, user: dict[str, Any], cfg: FavorabilityConfig, ts: float
     ) -> tuple[int, int, int]:
-        """计算因长期未互动导致的好感度衰减。
-
-        Returns:
-            (新分数, 实际变化值, 已未互动天数)
-        """
+        """计算因长期未互动导致的好感度衰减。返回 (新分数, 实际变化值, 未互动天数)"""
         last = float(user.get("last_interaction_at", user.get("updated_at", ts)) or ts)
         elapsed_days = int((ts - last) // 86400)
         old_score = int(user.get("score", cfg.score.default_score) or 0)
-
         if not cfg.inactivity_decay.enabled or elapsed_days <= int(cfg.inactivity_decay.grace_days):
             return old_score, 0, elapsed_days
-
         interval = max(1, int(cfg.inactivity_decay.interval_days))
         periods = 1 + (elapsed_days - int(cfg.inactivity_decay.grace_days)) // interval
         decay = min(periods * int(cfg.inactivity_decay.delta_per_interval), int(cfg.inactivity_decay.max_delta_once))
@@ -397,33 +382,18 @@ class FavorabilityStore:
         user = self.get_user(user_id, cfg.score.default_score)
         ts = now()
         new_score, actual_delta, elapsed = self._calculate_inactivity_decay(user, cfg, ts)
-
-        # 无论是否衰减，都刷新最后互动时间
         user["last_interaction_at"] = ts
         if actual_delta == 0:
             self.save_user(user_id, user)
             return user, 0
-
         user["score"] = new_score
         user["updated_at"] = ts
-
-        # 记录衰减原因
         if cfg.privacy.store_reasons and cfg.privacy.max_reason_records > 0:
-            records = user.setdefault("recent_reasons", [])
-            if not isinstance(records, list):
-                records = []
-                user["recent_reasons"] = records
-            records.append({
+            self._append_reason(user, {
                 "delta": actual_delta,
                 "reason": f"连续 {elapsed} 天未互动，好感度自然衰减",
-                "confidence": 1.0,
-                "risk": "inactivity_decay",
-                "timestamp": ts,
-                "session_id": session_id,
-            })
-            max_records = int(cfg.privacy.max_reason_records)
-            if len(records) > max_records:
-                del records[:-max_records]
-
+                "confidence": 1.0, "risk": "inactivity_decay",
+                "timestamp": ts, "session_id": session_id,
+            }, int(cfg.privacy.max_reason_records))
         self.save_user(user_id, user)
         return user, actual_delta

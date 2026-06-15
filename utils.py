@@ -66,10 +66,16 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
 
     先尝试整体解析；若失败则定位首尾花括号后截取解析。
     返回 dict 或 None。
+
+    改进：自动将中文双引号（“ ”）替换为英文双引号（" "），
+    提高对国内 AI 模型输出格式的兼容性。
     """
     raw = str(text or "").strip()
     if not raw:
         return None
+
+    # 替换中文双引号为英文双引号
+    raw = raw.replace("“", '"').replace("”", '"')
 
     # 尝试整体解析
     try:
