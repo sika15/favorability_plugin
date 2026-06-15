@@ -66,10 +66,12 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
 
     先尝试整体解析；若失败则定位首尾花括号后截取解析。
     返回 dict 或 None。
+    会兼容模型常见的中文弯引号输出。
     """
     raw = str(text or "").strip()
     if not raw:
         return None
+    raw = raw.replace("“", '"').replace("”", '"')
 
     # 尝试整体解析
     try:
@@ -108,7 +110,6 @@ def normalize_risk(risk: str, reason: str) -> str:
         return "insult"
     if any(kw in text for kw in ("性邀请", "亲密邀请", "做爱", "上床", "开房", "sex", "sexual_invitation")):
         return "sexual_invitation"
-
     # 合法的标准值
     valid = {"none", "spam", "insult", "sexual_harassment",
              "sexual_invitation", "prompt_injection", "unsafe_request"}
