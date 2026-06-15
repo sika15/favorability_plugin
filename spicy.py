@@ -22,8 +22,6 @@ from .constants import (
     SPICY_LOW_ALBUM, SPICY_MEDIUM_ALBUM, SPICY_REQUEST_PATTERN,
     TAUNT_MESSAGES,
 )
-from .immich import ImmichClient
-from .napcat import NapCatClient
 from .utils import (
     bot_name, clean_text, extract_asset_id, extract_json_object,
     normalize_for_match, now, tag_similarity,
@@ -32,22 +30,23 @@ from .utils import (
 if TYPE_CHECKING:
     from .plugin import FavorabilityPlugin
 
+# 缓存 TTL（秒）：从 5 分钟提升到 15 分钟，减少 API 调用
+_CACHE_TTL = 900
+# 冷却记录清理上限
+_MAX_COOLDOWNS = 200
+
 
 class SpicyImageHandler:
     """涩图请求处理器，管理从识别到发送的完整链路。"""
 
     def __init__(self, plugin: FavorabilityPlugin) -> None:
         self._plugin = plugin
-        # NapCat 客户端（图片发送与撤回）
-        self._napcat = NapCatClient(plugin)
         # 异步任务集合，用于卸载时取消
         self._tasks: set[asyncio.Task] = set()
         # 高好感用户等待偏好回复的暂存区：(session_id, user_id) → 偏好信息
         self._pending_preferences: dict[tuple[str, str], dict[str, Any]] = {}
         # 冷却计时：(session_id, user_id) → 上次触发时间戳
         self._cooldowns: dict[tuple[str, str], float] = {}
-        # Immich 客户端实例
-        self._immich_client: ImmichClient | None = None
         # 相册缓存：album_name → (album_dict, cached_at)
         self._album_cache: dict[str, tuple[dict[str, Any], float]] = {}
         # 标签缓存：(tag_list, cached_at)
@@ -56,13 +55,9 @@ class SpicyImageHandler:
     # ── 配置刷新 ─────────────────────────────────────────────────
 
     def refresh_immich_client(self) -> None:
-        """根据最新配置重建 Immich 客户端并清空缓存"""
-        cfg = self._plugin.config.spicy_image
-        base_url = cfg.immich_base_url.strip()
-        api_key = cfg.immich_api_key.strip()
+        """Immich 配置变化时清空缓存，客户端由主插件统一维护。"""
         self._album_cache.clear()
         self._tag_cache = ([], 0.0)
-        self._immich_client = ImmichClient(base_url, api_key) if base_url and api_key else None
 
     # ── 异步任务管理 ─────────────────────────────────────────────
 
@@ -93,7 +88,8 @@ class SpicyImageHandler:
         self, message: dict | None, session_id: str, user_id: str, is_group: bool
     ) -> None:
         """代理 NapCat 目标缓存（供主插件调用）"""
-        self._napcat.cache_target(message, session_id, user_id, is_group)
+        if self._plugin._napcat:
+            self._plugin._napcat.cache_target(message, session_id, user_id, is_group)
 
     # ── 偏好消费 ─────────────────────────────────────────────────
 
@@ -135,10 +131,15 @@ class SpicyImageHandler:
             return False
         if not await self._is_spicy_request(text):
             return False
-        # 冷却检查
+        # 冷却检查（附带过期清理）
         key = (session_id, user_id)
         cur = now()
         cooldown = max(0, int(cfg.spicy_image.cooldown_seconds))
+        # 定期清理过期冷却记录，防止内存无限增长
+        if len(self._cooldowns) > _MAX_COOLDOWNS:
+            expired = [k for k, v in self._cooldowns.items() if cur - v > cooldown * 2]
+            for k in expired:
+                del self._cooldowns[k]
         if cooldown and cur - float(self._cooldowns.get(key, 0.0) or 0.0) < cooldown:
             return True
         self._cooldowns[key] = cur
@@ -169,7 +170,7 @@ class SpicyImageHandler:
 
     async def _handle_request(self, user_id: str, session_id: str, score: int) -> None:
         """根据好感度选择相册并发送图片，或追问偏好"""
-        if self._immich_client is None:
+        if self._plugin._immich_client is None:
             await self._plugin.ctx.send.text("还没配置好 Immich 地址或 API Key，暂时找不到图。", session_id)
             return
         cfg = self._plugin.config.spicy_image
@@ -200,7 +201,6 @@ class SpicyImageHandler:
 
     async def _generate_preference_question(self, score: int) -> str:
         """通过 AI 生成高好感用户的偏好追问"""
-        cfg = self._plugin.config.spicy_image
         fallback = "想看什么类型的？说个关键词，我帮你翻翻看。"
         prompt = (
             f"你正在以{bot_name(self._plugin.config)}的口吻追问高好感用户想看什么类型的图片。\n"
@@ -309,24 +309,26 @@ class SpicyImageHandler:
 
     async def _get_cached_album(self, album_name: str) -> dict[str, Any] | None:
         """获取相册信息（5 分钟缓存）"""
-        if self._immich_client is None:
+        immich = self._plugin._immich_client
+        if immich is None:
             return None
         cached = self._album_cache.get(album_name)
-        if cached and now() - cached[1] <= 300:
+        if cached and now() - cached[1] <= _CACHE_TTL:
             return cached[0]
-        album = await self._immich_client.get_album_by_name(album_name)
+        album = await immich.get_album_by_name(album_name)
         if album:
             self._album_cache[album_name] = (album, now())
         return album
 
     async def _get_cached_tags(self) -> list[dict[str, Any]]:
         """获取标签列表（5 分钟缓存）"""
-        if self._immich_client is None:
+        immich = self._plugin._immich_client
+        if immich is None:
             return []
         tags, cached_at = self._tag_cache
-        if tags and now() - cached_at <= 300:
+        if tags and now() - cached_at <= _CACHE_TTL:
             return tags
-        tags = await self._immich_client.list_tags()
+        tags = await immich.list_tags()
         self._tag_cache = (tags, now())
         return tags
 
@@ -336,8 +338,12 @@ class SpicyImageHandler:
         self, session_id: str, album_name: str, tags: list[dict[str, Any]] | None = None
     ) -> bool:
         """从相册中随机选取并发送一张图片"""
-        if self._immich_client is None:
+        immich = self._plugin._immich_client
+        napcat = self._plugin._napcat
+        if immich is None:
             await self._plugin.ctx.send.text("还没配置好 Immich 地址或 API Key，暂时找不到图。", session_id)
+            return False
+        if napcat is None:
             return False
         album = await self._get_cached_album(album_name)
         if not album:
@@ -357,14 +363,14 @@ class SpicyImageHandler:
             if not asset_id:
                 continue
             try:
-                image_bytes = await self._immich_client.download_asset(asset_id)
+                image_bytes = await immich.download_asset(asset_id)
             except Exception:
                 continue
             # 通过 NapCat 发送
-            sent_id = await self._napcat.send_image(session_id, image_bytes)
+            sent_id = await napcat.send_image(session_id, image_bytes)
             if sent_id:
                 delay = int(self._plugin.config.spicy_image.recall_after_seconds)
-                self._napcat.schedule_recall(sent_id, self.spawn_task, delay)
+                napcat.schedule_recall(sent_id, self.spawn_task, delay)
                 return True
         return False
 
@@ -372,14 +378,15 @@ class SpicyImageHandler:
         self, album_id: str, tags: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """获取相册候选图片列表，带标签时走随机搜索"""
-        if self._immich_client is None:
+        immich = self._plugin._immich_client
+        if immich is None:
             return []
         if tags:
             tag_ids = [str(t.get("id") or "").strip() for t in tags if str(t.get("id") or "").strip()]
-            return await self._immich_client.search_random_assets(
+            return await immich.search_random_assets(
                 album_id, tag_ids, int(self._plugin.config.spicy_image.random_search_size)
             )
-        return await self._immich_client.get_album_assets(album_id)
+        return await immich.get_album_assets(album_id)
 
     # ── LLM 调用辅助 ─────────────────────────────────────────────
 

@@ -103,6 +103,7 @@ class FavorabilityPlugin(MaiBotPlugin):
         if self._spicy:
             await self._spicy.cancel_all()
         self._store.save()
+        self._store.close()
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         """配置更新回调"""
@@ -184,11 +185,11 @@ class FavorabilityPlugin(MaiBotPlugin):
         if not cfg.evaluation.enabled:
             return None
 
+        # 优化：message_count 仅在内存中累加，由评分触发时一并写入 DB
         user["message_count"] = int(user.get("message_count", 0) or 0) + 1
-        self._store.save_user(user_id, user)
 
         if self._evaluation:
-            self._evaluation.accumulate_and_maybe_eval(user_id, session_id, text, cfg)
+            self._evaluation.accumulate_and_maybe_eval(user_id, session_id, text, cfg, user)
 
         return None
 

@@ -13,14 +13,14 @@
 3. 新增恋人档渐进减速（使用 lover_growth_rate 替代粗暴 cap=2）
 4. 新增首因效应（新用户前 N 条评价有保护倍率）
 5. 晋级门槛统一由 levels 模块查询，不再硬编码
+6. 资源优化：使用持久连接 + WAL 模式 + 线程锁，避免频繁开关连接
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-import time
-from contextlib import closing
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -36,31 +36,53 @@ from .utils import clamp, clean_text, now, normalize_risk
 class FavorabilityStore:
     """好感度 SQLite 数据存储。
 
-    每次操作都打开独立连接（SQLite WAL 模式下可安全并发读），
-    避免长期持有连接导致锁问题。
+    使用持久连接 + WAL 模式 + 线程锁，避免每次操作都开关连接。
+    WAL 模式支持并发读，写操作通过 threading.Lock 串行化。
     """
 
     def __init__(self, path: Path) -> None:
         self._path = path
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
         self.load()
 
     # ── 初始化与迁移 ─────────────────────────────────────────────
 
     def load(self) -> None:
         """初始化数据库 schema 并尝试从旧版 JSON 迁移数据"""
-        with closing(self._connect()) as conn:
-            self._init_schema(conn)
-            self._migrate_legacy_json(conn)
+        conn = self._get_conn()
+        self._init_schema(conn)
+        self._migrate_legacy_json(conn)
 
     def save(self) -> None:
         """兼容旧版接口，SQLite 模式下无需手动保存"""
         return None
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def close(self) -> None:
+        """关闭持久连接（插件卸载时调用）"""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """获取持久连接（惰性创建），启用 WAL 模式提升并发读性能"""
+        if self._conn is None:
+            conn = sqlite3.connect(
+                str(self._path),
+                check_same_thread=False,
+                timeout=5,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-2000")  # 2MB 缓存
+            conn.execute("PRAGMA temp_store=MEMORY")
+            self._conn = conn
+        return self._conn
 
     @staticmethod
     def _init_schema(conn: sqlite3.Connection) -> None:
@@ -194,16 +216,29 @@ class FavorabilityStore:
 
     def save_user(self, user_id: str, user: dict[str, Any]) -> None:
         """保存（更新）单个用户数据"""
-        with closing(self._connect()) as conn:
+        with self._lock:
+            conn = self._get_conn()
             default = int(user.get("score", 0) or 0)
             self._upsert_user(conn, user_id, self._normalize_user(user, default))
             conn.commit()
+
+    @staticmethod
+    def _append_reason(user: dict[str, Any], record: dict[str, Any], max_records: int) -> None:
+        """追加评分记录并裁剪数量。"""
+        records = user.setdefault("recent_reasons", [])
+        if not isinstance(records, list):
+            records = []
+            user["recent_reasons"] = records
+        records.append(record)
+        if len(records) > max_records:
+            del records[:-max_records]
 
     # ── 读取操作 ─────────────────────────────────────────────────
 
     def get_user(self, user_id: str, default_score: int) -> dict[str, Any]:
         """获取用户数据，不存在则创建默认记录"""
-        with closing(self._connect()) as conn:
+        with self._lock:
+            conn = self._get_conn()
             row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
             if row is not None:
                 return self._row_to_user(row)
@@ -224,7 +259,8 @@ class FavorabilityStore:
 
     def reset(self, user_id: str, cfg: FavorabilityConfig) -> dict[str, Any]:
         """重置用户好感度为默认值（删除后重建）"""
-        with closing(self._connect()) as conn:
+        with self._lock:
+            conn = self._get_conn()
             conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
             conn.commit()
         return self.get_user(user_id, cfg.score.default_score)
@@ -238,7 +274,7 @@ class FavorabilityStore:
         risk: str,
         session_id: str,
         cfg: FavorabilityConfig,
-    ) -> tuple[dict[str, Any], int]:
+    ) -> tuple[dict[str, Any], int, int]:
         """应用好感度变化值（重构版）。
 
         处理链路：
@@ -251,7 +287,7 @@ class FavorabilityStore:
         7. 写入变更 + 记录原因
 
         Returns:
-            (更新后的用户字典, 实际变化值)
+            (更新后的用户字典, 实际变化值, 缓冲前变化值)
         """
         user = self.get_user(user_id, cfg.score.default_score)
         risk = normalize_risk(risk, reason)
@@ -278,9 +314,10 @@ class FavorabilityStore:
             adj_delta = 0
 
         # ── 步骤 2：首因效应保护 ──
-        # 新用户（正向评价 < 5 次）的负向 delta 缩小，避免初始印象被单条消息毁掉
+        # 新用户前几次评价的负向 delta 缩小，避免初始印象被单条消息毁掉
         eval_count = int(user.get("positive_eval_count", 0) or 0) + int(user.get("negative_eval_count", 0) or 0)
-        if adj_delta < 0 and eval_count < 5:
+        first_threshold = int(cfg.score.first_impression_eval_threshold)
+        if adj_delta < 0 and first_threshold > 0 and eval_count < first_threshold:
             adj_delta = max(-2, round(adj_delta * 0.5))
 
         # ── 步骤 3：高好感辱骂豁免 ──
@@ -293,9 +330,12 @@ class FavorabilityStore:
             rate = lover_growth_rate(old_score)
             adj_delta = max(1, round(adj_delta * rate))
 
+        # 保留缓冲前变化值，用于通知显示和评分记录。
+        raw_delta = adj_delta
+
         # ── 步骤 5：降级缓冲 ──
         # 高级档扣分时先消耗缓冲区，缓冲区内只降到门槛线，不掉级
-        if adj_delta < 0:
+        if adj_delta < 0 and cfg.progression.demotion_buffer_enabled:
             buffer = demotion_buffer_for_score(old_score)
             if buffer > 0:
                 threshold = score_threshold_for_level(level_for_score(old_score))
@@ -336,27 +376,28 @@ class FavorabilityStore:
             user["positive_eval_count"] = int(user.get("positive_eval_count", 0) or 0) + 1
         elif actual_delta < 0:
             user["negative_eval_count"] = int(user.get("negative_eval_count", 0) or 0) + 1
+        elif raw_delta < 0:
+            # 扣分被缓冲完全吸收时，仍记录一次负面评价。
+            user["negative_eval_count"] = int(user.get("negative_eval_count", 0) or 0) + 1
 
         # 记录评分原因
         if cfg.privacy.store_reasons and cfg.privacy.max_reason_records > 0:
-            records = user.setdefault("recent_reasons", [])
-            if not isinstance(records, list):
-                records = []
-                user["recent_reasons"] = records
-            records.append({
+            record = {
                 "delta": actual_delta,
                 "reason": clean_text(reason, 160),
                 "confidence": round(float(confidence), 3),
                 "risk": risk,
                 "timestamp": now(),
                 "session_id": session_id,
-            })
-            max_records = int(cfg.privacy.max_reason_records)
-            if len(records) > max_records:
-                del records[:-max_records]
+            }
+            if raw_delta != actual_delta:
+                record["raw_delta"] = raw_delta
+                if raw_delta < 0 and actual_delta > raw_delta:
+                    record["buffered"] = True
+            self._append_reason(user, record, int(cfg.privacy.max_reason_records))
 
         self.save_user(user_id, user)
-        return user, actual_delta
+        return user, actual_delta, raw_delta
 
     # ── 久未互动衰减 ─────────────────────────────────────────────
 
@@ -393,37 +434,38 @@ class FavorabilityStore:
     def apply_inactivity_decay(
         self, user_id: str, cfg: FavorabilityConfig, session_id: str = ""
     ) -> tuple[dict[str, Any], int]:
-        """应用久未互动衰减并写入数据库"""
+        """应用久未互动衰减并写入数据库。
+
+        优化：仅在真正发生衰减或距上次写入超过 1 小时时才写 DB，
+        避免每条消息都触发无意义的写入。
+        """
         user = self.get_user(user_id, cfg.score.default_score)
         ts = now()
         new_score, actual_delta, elapsed = self._calculate_inactivity_decay(user, cfg, ts)
 
-        # 无论是否衰减，都刷新最后互动时间
-        user["last_interaction_at"] = ts
         if actual_delta == 0:
+            # 无衰减：仅当 last_interaction_at 超过 1 小时未更新时才刷新
+            last_write = float(user.get("last_interaction_at", 0) or 0)
+            if ts - last_write < 3600:
+                return user, 0
+            user["last_interaction_at"] = ts
             self.save_user(user_id, user)
             return user, 0
 
         user["score"] = new_score
         user["updated_at"] = ts
+        user["last_interaction_at"] = ts
 
         # 记录衰减原因
         if cfg.privacy.store_reasons and cfg.privacy.max_reason_records > 0:
-            records = user.setdefault("recent_reasons", [])
-            if not isinstance(records, list):
-                records = []
-                user["recent_reasons"] = records
-            records.append({
+            self._append_reason(user, {
                 "delta": actual_delta,
                 "reason": f"连续 {elapsed} 天未互动，好感度自然衰减",
                 "confidence": 1.0,
                 "risk": "inactivity_decay",
                 "timestamp": ts,
                 "session_id": session_id,
-            })
-            max_records = int(cfg.privacy.max_reason_records)
-            if len(records) > max_records:
-                del records[:-max_records]
+            }, int(cfg.privacy.max_reason_records))
 
         self.save_user(user_id, user)
         return user, actual_delta

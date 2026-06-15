@@ -9,6 +9,7 @@
 2. 亲密边界策略统一由 levels.build_intimacy_line 生成
 3. 注入提示词结构更清晰，分区块标注
 4. 支持显示"距离下一等级的进度"提示
+5. 资源优化：_recent_speakers 缓存增加 TTL 清理和容量上限
 """
 
 from __future__ import annotations
@@ -26,6 +27,9 @@ from .utils import clean_text, now
 if TYPE_CHECKING:
     from .plugin import FavorabilityPlugin
 
+# 内存缓存上限
+_MAX_RECENT_SPEAKERS = 200
+
 
 class InjectionHandler:
     """回复提示注入处理器：解析目标用户 → 构建提示词 → 注入到 replyer"""
@@ -40,7 +44,25 @@ class InjectionHandler:
     def update_recent_speaker(
         self, session_id: str, user_id: str, is_group: bool
     ) -> None:
-        """记录最近发言者（供回复目标解析使用）"""
+        """记录最近发言者（供回复目标解析使用）。
+
+        优化：超出容量上限时清理过期条目。
+        """
+        # 容量清理：超过上限时移除过期条目（>5分钟）
+        if len(self._recent_speakers) >= _MAX_RECENT_SPEAKERS:
+            ts = now()
+            expired = [
+                k for k, v in self._recent_speakers.items()
+                if ts - v[1] > 300
+            ]
+            for k in expired:
+                del self._recent_speakers[k]
+            # 如果仍然超限，移除最早的一半
+            if len(self._recent_speakers) >= _MAX_RECENT_SPEAKERS:
+                keys = list(self._recent_speakers.keys())
+                for k in keys[:len(keys) // 2]:
+                    del self._recent_speakers[k]
+
         self._recent_speakers[session_id] = (user_id, now(), is_group)
 
     async def inject_reply_prompt(self, **kwargs: Any) -> dict[str, Any] | None:
