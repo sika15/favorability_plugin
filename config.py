@@ -1,21 +1,26 @@
 """
 好感度插件 - 配置类定义
 
-使用 MaiBot SDK 的 PluginConfigBase 体系，将所有可配置项按功能分区组织。
-每个 Section 对应管理面板中的一个 UI 分组。
+定义插件所有可配置项，使用 MaiBot SDK 的 PluginConfigBase 体系。
+每个 Section 对应一个配置分组，在管理面板中以独立卡片展示。
+
+重构变更：
+1. ProgressionSection 新增 demotion_buffer 配置（降级缓冲分值）
+2. ScoreSection 新增 first_impression_eval_threshold（首因效应保护次数）
+3. InjectionSection 新增 show_progress_hint（是否显示升级进度提示）
 """
 
 from __future__ import annotations
 
 from maibot_sdk import Field, PluginConfigBase
 
-from .constants import CONFIG_SCHEMA_VERSION
+# 配置 schema 版本号
+CONFIG_SCHEMA_VERSION = "2.0.0"
 
 
 class PluginSection(PluginConfigBase):
-    """插件全局开关与基本信息"""
+    """插件全局开关与基本设置"""
     __ui_label__ = "插件设置"
-
     enabled: bool = Field(default=True, description="是否启用好感度插件")
     bot_name: str = Field(default="麦麦", description="好感度关系中的机器人显示名称")
     config_version: str = Field(
@@ -26,27 +31,36 @@ class PluginSection(PluginConfigBase):
 
 
 class ScoreSection(PluginConfigBase):
-    """好感度分数范围与变化规则"""
+    """好感度分数核心参数"""
     __ui_label__ = "分数设置"
-
     min_score: int = Field(default=-100, ge=-1000, le=0, description="最低好感度")
     max_score: int = Field(default=100, ge=1, le=1000, description="最高好感度")
     default_score: int = Field(default=0, description="新用户默认好感度")
-    max_delta_per_eval: int = Field(default=8, ge=1, le=50, description="单次 AI 评分最大变化值")
-    positive_delta_multiplier: float = Field(default=1.5, ge=0.1, le=10.0, description="正向变化倍率")
-    negative_delta_multiplier: float = Field(default=1.5, ge=0.1, le=10.0, description="负向变化倍率")
+    max_delta_per_eval: int = Field(
+        default=8, ge=1, le=50, description="单次 AI 评分最大变化值（原始 delta 上限）"
+    )
+    positive_delta_multiplier: float = Field(
+        default=1.5, ge=0.1, le=10.0,
+        description="正向变化倍率（修复后真正生效，最终上限 = max_delta × multiplier）",
+    )
+    negative_delta_multiplier: float = Field(
+        default=1.5, ge=0.1, le=10.0,
+        description="负向变化倍率（修复后真正生效，最终上限 = max_delta × multiplier）",
+    )
     ignore_abuse_negative_min_score: int = Field(
-        default=80,
-        ge=-1000,
-        le=1000,
+        default=80, ge=-1000, le=1000,
         description="达到该好感度后，辱骂和性骚扰不再扣好感度",
+    )
+    # 重构新增：首因效应保护
+    first_impression_eval_threshold: int = Field(
+        default=5, ge=0, le=50,
+        description="新用户前 N 次评价中，负向 delta 自动缩小（首因效应保护），0 表示关闭",
     )
 
 
 class InactivityDecaySection(PluginConfigBase):
-    """长期未互动导致的好感度衰减规则"""
+    """长期未互动的好感度自然衰减"""
     __ui_label__ = "久未互动衰减"
-
     enabled: bool = Field(default=True, description="是否启用长期未互动扣好感度")
     grace_days: int = Field(default=14, ge=1, le=3650, description="超过多少天未互动后开始扣分")
     interval_days: int = Field(default=7, ge=1, le=3650, description="超过宽限期后每隔多少天扣一次")
@@ -56,9 +70,8 @@ class InactivityDecaySection(PluginConfigBase):
 
 
 class EvaluationSection(PluginConfigBase):
-    """AI 自动评分相关配置"""
+    """AI 自动评分相关参数"""
     __ui_label__ = "AI 评分"
-
     enabled: bool = Field(default=True, description="是否启用 AI 自动评分")
     messages_per_eval: int = Field(default=3, ge=1, le=50, description="累计多少条消息后触发一次评分")
     cooldown_seconds: int = Field(default=300, ge=0, le=86400, description="同一用户两次评分最小间隔秒数")
@@ -70,9 +83,8 @@ class EvaluationSection(PluginConfigBase):
 
 
 class FeedbackSection(PluginConfigBase):
-    """好感度变化后的用户反馈提示"""
+    """好感度变化时的反馈提示"""
     __ui_label__ = "变化反馈"
-
     enabled: bool = Field(default=True, description="好感度变化时是否发送简短提示")
     min_abs_delta_to_notify: int = Field(default=2, ge=1, le=1000, description="变化绝对值达到多少才提示")
     show_delta_value: bool = Field(default=True, description="提示中是否显示具体变化值")
@@ -87,41 +99,53 @@ class FeedbackSection(PluginConfigBase):
 
 
 class ProgressionSection(PluginConfigBase):
-    """等级晋升门槛配置"""
+    """等级晋级门槛与降级保护"""
     __ui_label__ = "升级门槛"
-
     liked_unlock_min_confidence: float = Field(
-        default=0.65, ge=0.0, le=1.0, description="升入喜欢档最低置信度",
+        default=0.65, ge=0.0, le=1.0, description="升入喜欢档最低置信度"
     )
     lover_unlock_min_confidence: float = Field(
-        default=0.8, ge=0.0, le=1.0, description="升入恋人档最低置信度",
+        default=0.8, ge=0.0, le=1.0, description="升入恋人档最低置信度"
     )
     lover_min_positive_eval_count: int = Field(
-        default=10, ge=0, le=9999, description="升入恋人档所需正向评价次数",
+        default=10, ge=0, le=9999, description="升入恋人档所需正向评价次数"
     )
-    lover_growth_slowdown: bool = Field(default=True, description="恋人档增长是否减速")
+    lover_growth_slowdown: bool = Field(
+        default=True, description="恋人档增长是否减速（渐进曲线替代粗暴 cap）"
+    )
+    # 重构新增：降级缓冲
+    demotion_buffer_enabled: bool = Field(
+        default=True, description="是否启用高级档降级缓冲（扣分先消耗缓冲再掉级）"
+    )
 
 
 class InjectionSection(PluginConfigBase):
-    """回复提示注入配置，控制机器人回复语气受好感度影响的程度"""
+    """回复提示注入相关配置"""
     __ui_label__ = "回复影响"
-
     enabled: bool = Field(default=True, description="是否在 replyer 前注入关系提示")
     hide_score_from_reply: bool = Field(default=True, description="普通回复中是否隐藏具体好感度数值")
     inject_when_uncertain: bool = Field(default=False, description="无法确认目标用户时是否注入通用提示")
     max_prompt_length: int = Field(default=1000, ge=100, le=3000, description="关系提示最大长度")
     lover_style_in_group: bool = Field(default=False, description="群聊是否允许表现恋人风格")
-    group_lover_display_level: str = Field(default="亲近的人", description="恋人在群聊中降级表现的等级")
+    group_lover_display_level: str = Field(
+        default="亲近的人", description="恋人在群聊中降级表现的等级"
+    )
     private_lover_names: list[str] = Field(
         default_factory=lambda: ["亲爱的", "笨蛋", "最喜欢的人"],
         description="私聊恋人档可用亲昵称呼",
     )
+    # 重构新增
+    show_progress_hint: bool = Field(
+        default=True, description="注入提示中是否显示距下一等级的进度"
+    )
+    show_buffer_hint: bool = Field(
+        default=True, description="注入提示中是否显示关系动摇提示（降级缓冲激活时）"
+    )
 
 
 class PrivacySection(PluginConfigBase):
-    """隐私与权限配置"""
+    """隐私与数据可见性"""
     __ui_label__ = "隐私"
-
     allow_user_query_self: bool = Field(default=True, description="是否允许用户查询自己")
     allow_user_query_others: bool = Field(default=False, description="是否允许普通用户查询别人")
     allow_admin_query_others: bool = Field(default=True, description="是否允许管理员查询别人")
@@ -132,25 +156,22 @@ class PrivacySection(PluginConfigBase):
 class AdminSection(PluginConfigBase):
     """管理员权限配置"""
     __ui_label__ = "管理员"
-
     admin_user_ids: list[str] = Field(default_factory=list, description="可管理好感度的 QQ 号列表")
     allow_manual_adjust: bool = Field(default=True, description="是否允许管理员手动调整")
     allow_reset: bool = Field(default=True, description="是否允许管理员重置")
 
 
 class DebugSection(PluginConfigBase):
-    """调试日志配置"""
+    """调试日志开关"""
     __ui_label__ = "调试日志"
-
     enabled: bool = Field(default=False, description="是否输出好感度插件调试日志")
     log_level: str = Field(default="debug", description="调试日志级别：debug 或 info")
     include_message_preview: bool = Field(default=False, description="是否在调试日志中包含用户消息截断摘要")
 
 
 class SpicyImageSection(PluginConfigBase):
-    """涩图请求功能配置，依赖 Immich 图库"""
+    """涩图请求相关配置"""
     __ui_label__ = "涩图请求"
-
     enabled: bool = Field(default=True, description="是否启用自然语言涩图请求")
     immich_base_url: str = Field(default="", description="Immich 地址，例如 http://127.0.0.1:2283")
     immich_api_key: str = Field(default="", description="Immich API Key")
@@ -171,7 +192,7 @@ class SpicyImageSection(PluginConfigBase):
 
 
 class FavorabilityConfig(PluginConfigBase):
-    """好感度插件总配置，聚合所有子配置分区"""
+    """好感度插件总配置（聚合所有 Section）"""
     plugin: PluginSection = Field(default_factory=PluginSection)
     score: ScoreSection = Field(default_factory=ScoreSection)
     inactivity_decay: InactivityDecaySection = Field(default_factory=InactivityDecaySection)
