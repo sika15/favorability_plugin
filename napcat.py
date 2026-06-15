@@ -20,8 +20,8 @@ if TYPE_CHECKING:
     from .plugin import FavorabilityPlugin
 
 
-class NapCatClient:
-    """NapCat HTTP API 客户端，负责图片发送、撤回和目标缓存。"""
+class NapCatHelper:
+    """NapCat HTTP API 辅助类，负责图片发送、撤回和目标缓存。"""
 
     def __init__(self, plugin: FavorabilityPlugin) -> None:
         self._plugin = plugin
